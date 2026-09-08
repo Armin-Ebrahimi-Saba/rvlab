@@ -25,9 +25,18 @@
 // CPU moving the bytes.
 
 module tinytpu #(
-  parameter int ACT_WORDS = 512,   // 128-bit words
-  parameter int WGT_WORDS = 512,
-  parameter int OUT_WORDS = 512,
+  // Buffer capacities, in 128-bit words. `sw/tiling.py` picks these: it fits
+  // every GEMM of a ViT-S block into them and reports the DRAM traffic the
+  // resulting tiling costs. The weight buffer is the asymmetric one because it
+  // is indexed by k *row* -- it holds K words per 16 output channels, sixteen
+  // times the activation buffer's appetite for the same K -- so fc2's K=1536
+  // and attention's K=1370 are what size it. At 512 words seven of a block's
+  // 38 GEMMs do not fit at all; at 3072 all of them do, and the block's DRAM
+  // time (2.61 s/image) drops below the array's compute floor (3.62 s/image),
+  // which is the point past which more buffer buys nothing.
+  parameter int ACT_WORDS = 512,   // 8 KB
+  parameter int WGT_WORDS = 3072,  // 48 KB
+  parameter int OUT_WORDS = 512,   // 8 KB
   parameter int ROWS      = 16,
   parameter int COLS      = 16,
   parameter int MBLK      = 16,
