@@ -22,11 +22,8 @@ sw_dirs = [
     "monitor",
     "minimal",
     "test_sim_ddr",
-    "test_rvlab",
-    "coremark",
+    "test_rvlab",  # required: Sources uses it for BRAM init (swinit)
     "test_irq",
-    "rlight",
-    "dma",
     "project",
 ]
 
@@ -56,8 +53,6 @@ flow['rvlab_fpga_top'] = RvlabFpgaTop(dependency_map={'srcs':'srcs'})
 # -----------
 
 module_tbs = [
-    "student_rlight_tb",
-    "student_tlul_mux_tb"
 ]
 
 for name in module_tbs:

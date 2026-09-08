@@ -597,44 +597,4 @@
       <obj_property name="DisplayName">label</obj_property>
       <obj_property name="BkColor">#FFD700</obj_property>
    </wvobject>
-   <wvobject type="array" fp_name="/system_tb/board/DUT/core_i/student_i/rlight_i/led_o">
-      <obj_property name="ElementShortName">led_o[7:0]</obj_property>
-      <obj_property name="ObjectShortName">led_o[7:0]</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/system_tb/board/DUT/core_i/student_i/rlight_i/regA">
-      <obj_property name="ElementShortName">regA[31:0]</obj_property>
-      <obj_property name="ObjectShortName">regA[31:0]</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/system_tb/board/DUT/core_i/student_i/rlight_i/regB">
-      <obj_property name="ElementShortName">regB[7:0]</obj_property>
-      <obj_property name="ObjectShortName">regB[7:0]</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/system_tb/board/DUT/core_i/student_i/rlight_i/state">
-      <obj_property name="ElementShortName">state[1:0]</obj_property>
-      <obj_property name="ObjectShortName">state[1:0]</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/system_tb/board/DUT/core_i/student_i/rlight_i/cnt">
-      <obj_property name="ElementShortName">cnt[1:0]</obj_property>
-      <obj_property name="ObjectShortName">cnt[1:0]</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/system_tb/board/DUT/core_i/student_i/rlight_i/addr">
-      <obj_property name="ElementShortName">addr[3:0]</obj_property>
-      <obj_property name="ObjectShortName">addr[3:0]</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/system_tb/board/DUT/core_i/student_i/rlight_i/rdata">
-      <obj_property name="ElementShortName">rdata[31:0]</obj_property>
-      <obj_property name="ObjectShortName">rdata[31:0]</obj_property>
-   </wvobject>
-   <wvobject type="logic" fp_name="/system_tb/board/DUT/core_i/student_i/rlight_i/re">
-      <obj_property name="ElementShortName">re</obj_property>
-      <obj_property name="ObjectShortName">re</obj_property>
-   </wvobject>
-   <wvobject type="array" fp_name="/system_tb/board/DUT/core_i/student_i/rlight_i/wdata">
-      <obj_property name="ElementShortName">wdata[31:0]</obj_property>
-      <obj_property name="ObjectShortName">wdata[31:0]</obj_property>
-   </wvobject>
-   <wvobject type="logic" fp_name="/system_tb/board/DUT/core_i/student_i/rlight_i/we">
-      <obj_property name="ElementShortName">we</obj_property>
-      <obj_property name="ObjectShortName">we</obj_property>
-   </wvobject>
 </wave_config>

@@ -24,8 +24,11 @@ int ddr_init(void);
 #include <reggen/rv_timer.h>
 #define RV_TIMER0_BASE_ADDR 0x1f000000
 
-#include <reggen/student_dma.h>
-#define STUDENT_DMA0_BASE_ADDR 0x20000000
+// tiny-tpu: control/status registers on the peri port, bulk activation access
+// on the fast port. See report.md section 5.
+#include <reggen/tinytpu.h>
+#define TINYTPU_REGS_BASE_ADDR 0x10000000
+#define TINYTPU_CORE_BASE_ADDR 0x20000000
 
 // Add includes for additional register definition headers
 // and define corresponding _BASE_ADDR values here.

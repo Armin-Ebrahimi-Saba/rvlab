@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: SHL-2.1
+// SPDX-FileCopyrightText: 2024 RVLab Contributors
+
+// tiny-tpu control plane.
+//
+// Only control and status live here, on the slow peripheral port. The bulk data
+// -- activations, weights, results and the per-output-channel requantization
+// constants -- is mapped into the fast port's aperture as plain memory, so the
+// CPU (or the weight DMA) moves it with ordinary stores instead of one
+// MMIO write per value. A 1536-channel GEMM would otherwise need ~6000 register
+// writes just to set up its requantization constants.
+{
+  name: "tinytpu"
+  clock_primary: "sys_clk"
+  bus_device: "tlul"
+  regwidth: "32"
+  registers: [
+    {
+      name: "id"
+      desc: "Identification magic, reads 0x54505530 ('TPU0'). Lets the driver confirm the peripheral is present before touching anything else."
+      swaccess: "ro"
+      hwaccess: "hwo"
+      hwext: "true"
+      fields: [
+        {bits: "31:0", name: "val", desc: "magic value"}
+      ]
+    }
+    {
+      name: "ctrl"
+      desc: "Command register. Writing generates a single-cycle pulse in hardware; the bits do not stay set."
+      swaccess: "wo"
+      hwaccess: "hro"
+      hwqe: "true"
+      fields: [
+        {bits: "0", name: "start", desc: "Start the operation described by op/shape"}
+        {bits: "1", name: "clr_done", desc: "Clear the sticky done flag"}
+        {bits: "2", name: "dma_start", desc: "Start the weight DMA described by dma_src/dma_dst/dma_len"}
+        {bits: "3", name: "clr_dma_done", desc: "Clear the sticky DMA done and error flags"}
+      ]
+    }
+    {
+      name: "status"
+      desc: "Engine status."
+      swaccess: "ro"
+      hwaccess: "hwo"
+      hwext: "true"
+      fields: [
+        {bits: "0", name: "busy", desc: "Engine is running"}
+        {bits: "1", name: "done", desc: "Sticky: an operation completed since the last clr_done"}
+        {bits: "2", name: "dma_busy", desc: "Weight DMA is running"}
+        {bits: "3", name: "dma_done", desc: "Sticky: a DMA completed since the last clr_dma_done"}
+        {bits: "4", name: "dma_err", desc: "Sticky: the DMA saw a TL-UL error response, i.e. it read an unmapped address"}
+      ]
+    }
+    {
+      name: "op"
+      desc: "Which operation ctrl.start launches."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "3:0", name: "code", resval: "0", desc: "0 = GEMM, 1 = softmax, 2 = layernorm, 3 = residual add, 4 = activation LUT, 5 = transpose. ctrl.start dispatches on this."}
+      ]
+    }
+    {
+      name: "shape"
+      desc: "GEMM shape. K and N are counted in whole 16-wide tiles because the host pads them; M is counted in rows because it is blocked, not padded."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "11:0",  name: "m",       resval: "0", desc: "Activation rows"}
+        {bits: "19:12", name: "k_tiles", resval: "0", desc: "Reduction depth in 16-deep tiles"}
+        {bits: "27:20", name: "n_tiles", resval: "0", desc: "Output channels in 16-wide tiles"}
+      ]
+    }
+    {
+      name: "dma_src"
+      desc: "Byte address the weight DMA reads from, on the main crossbar. 16-byte aligned; the low four bits are ignored. DDR3 lives at 0x80000000, but any device the student host port can reach is legal."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "31:0", name: "addr", resval: "0", desc: "source byte address"}
+      ]
+    }
+    {
+      name: "dma_dst"
+      desc: "Where the weight DMA writes, as a 128-bit word index inside one of the fast-port data regions."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "15:0",  name: "word",   resval: "0", desc: "128-bit word index within the region"}
+        {bits: "17:16", name: "region", resval: "0", desc: "0 = activations, 1 = weights, 2 = results"}
+      ]
+    }
+    {
+      name: "dma_len"
+      desc: "Weight DMA transfer length, in 128-bit words. Writing 0 makes ctrl.dma_start a no-op."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "16:0", name: "words", resval: "0", desc: "number of 128-bit words to move"}
+      ]
+    }
+    {
+      name: "vec_cfg"
+      desc: "Vector op geometry. Elements are int8 and packed flat: rows*len of them, starting at a word-aligned offset."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "15:0",  name: "len",  resval: "0", desc: "Elements per row. Softmax and layernorm normalize over this; the elementwise ops only use it to count."}
+        {bits: "31:16", name: "rows", resval: "0", desc: "Number of rows"}
+      ]
+    }
+    {
+      name: "src_a"
+      desc: "Operand A: which buffer it sits in and where. Both engines use this -- the GEMM's activations and the vector unit's input are the same port. Reading operand A out of the result region is what lets an intermediate stay where the op that produced it left it, instead of being DMA'd back into the activation buffer."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "15:0", name: "word", resval: "0", desc: "128-bit word index within the region"}
+        {bits: "17:16", name: "region", resval: "0", desc: "0 = activations, 2 = results. Any other value reads activations."}
+      ]
+    }
+    {
+      name: "src_b"
+      desc: "Operand B: the GEMM's weights, the residual add's second addend, or a GEMM whose stationary operand is another op's output. Same encoding as src_a, with the weight buffer in place of the activation buffer."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "15:0", name: "word", resval: "0", desc: "128-bit word index within the region"}
+        {bits: "17:16", name: "region", resval: "1", desc: "1 = weights, 2 = results. Any other value reads weights."}
+      ]
+    }
+    {
+      name: "dst"
+      desc: "Destination, as a 128-bit word index into the result region. Both engines write here; results never leave the result region, so there is no region field."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "15:0", name: "word", resval: "0", desc: "word index"}
+      ]
+    }
+    {
+      name: "vec_mult"
+      desc: "Requantization multiplier for the op's output; for residual add, the multiplier for operand A."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "31:0", name: "val", resval: "0", desc: "normalized multiplier"}
+      ]
+    }
+    {
+      name: "vec_mult_b"
+      desc: "Residual add: the multiplier for operand B."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "31:0", name: "val", resval: "0", desc: "normalized multiplier"}
+      ]
+    }
+    {
+      name: "vec_shift"
+      desc: "Requantization shifts to match vec_mult and vec_mult_b."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "5:0",   name: "a", resval: "0", desc: "shift for vec_mult"}
+        {bits: "13:8",  name: "b", resval: "0", desc: "shift for vec_mult_b"}
+      ]
+    }
+    {
+      name: "vec_eps_lo"
+      desc: "Layernorm epsilon, already scaled by the emulator into the variance accumulator's units. Low half."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "31:0", name: "val", resval: "0", desc: "eps[31:0]"}
+      ]
+    }
+    {
+      name: "vec_eps_hi"
+      desc: "Layernorm epsilon, high half."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "31:0", name: "val", resval: "0", desc: "eps[63:32]"}
+      ]
+    }
+  ]
+}

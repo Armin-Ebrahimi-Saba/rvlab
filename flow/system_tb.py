@@ -133,6 +133,15 @@ class SystemTb(Block):
             libs=['unisims_ver', 'secureip']) # Xilinx XSim has this as builtin library. 
 
     @task(requires={
+        'srcs':'srcs.srcs_noddr',
+        'sw':'sw.delta',
+        })
+    def sim_rtl_xsim_batch(self, cwd, srcs, sw):
+        """RTL simulation with XSim, batch mode (no GUI -- for CI / scripted runs)"""
+        self.simulate('xsim', cwd, srcs, sw, batch=True,
+            libs=['unisims_ver', 'secureip'])
+
+    @task(requires={
         'srcs':'srcs.srcs',
         'sw':'sw.delta',
         })

@@ -701,16 +701,6 @@ add wave -noupdate /system_tb/board/DUT/core_i/tl_cpud_d2h
 add wave -noupdate /system_tb/board/DUT/core_i/tl_bram_main_h2d
 add wave -noupdate /system_tb/board/DUT/core_i/tl_bram_main_d2h
 add wave -noupdate -divider {Running Light}
-add wave -noupdate /system_tb/board/DUT/core_i/student_i/rlight_i/led_o
-add wave -noupdate /system_tb/board/DUT/core_i/student_i/rlight_i/regA
-add wave -noupdate /system_tb/board/DUT/core_i/student_i/rlight_i/regB
-add wave -noupdate /system_tb/board/DUT/core_i/student_i/rlight_i/state
-add wave -noupdate /system_tb/board/DUT/core_i/student_i/rlight_i/cnt
-add wave -noupdate /system_tb/board/DUT/core_i/student_i/rlight_i/addr
-add wave -noupdate /system_tb/board/DUT/core_i/student_i/rlight_i/rdata
-add wave -noupdate /system_tb/board/DUT/core_i/student_i/rlight_i/re
-add wave -noupdate /system_tb/board/DUT/core_i/student_i/rlight_i/wdata
-add wave -noupdate /system_tb/board/DUT/core_i/student_i/rlight_i/we
 TreeUpdate [SetDefaultTree]
 WaveRestoreCursors {{Cursor 1} {40160000000 fs} 0}
 quietly wave cursor active 1
