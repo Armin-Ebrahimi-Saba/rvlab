@@ -66,11 +66,18 @@ module tinytpu_buf #(
   wire [LB-1:0] cpu_lane = cpu_addr[LB-1:0];
   wire [WA-1:0] cpu_word = cpu_addr[LB+WA-1:LB];
 
-  logic [31:0] cpu_rd_lane [LANES];
-  logic [31:0] eng_rd_lane [RPORTS][LANES];
+  wire [31:0] cpu_rd_lane [LANES];
+  wire [31:0] eng_rd_lane [RPORTS][LANES];
 
   for (genvar c = 0; c < COPIES; c++) begin : g_copy
     for (genvar l = 0; l < LANES; l++) begin : g_bank
+      // Everything below is one Xilinx byte-write-enable simple-dual-port BRAM,
+      // written the way the inference template wants it: a single always_ff
+      // holding one write and one read, both with the address and the byte
+      // enables already resolved. Splitting the read into its own process --
+      // which reads far more naturally -- makes the attribute below
+      // "infeasible" and drops the array into ~24k LUTs of distributed RAM.
+      (* ram_style = "block" *)
       logic [31:0] bank [WORDS];
 
       // Reading a never-written location must not put X on the bus. TL-UL's
@@ -83,30 +90,38 @@ module tinytpu_buf #(
       // One write port, shared. The CPU and the engine never write at once:
       // software fills the buffers while the engine is idle. Every copy takes
       // every write, which is what keeps them identical.
+      wire cpu_hit = cpu_req && cpu_we && (cpu_lane == LB'(l));
+
+      wire [WA-1:0] waddr = cpu_hit ? cpu_word : eng_waddr;
+      wire [31:0]   wdata = cpu_hit ? cpu_wdata : eng_wdata[32*l +: 32];
+
+      // The engine's byte mask exists for the vector unit: its last output word
+      // of a run is usually partial, and a full-word write there would clobber
+      // whatever follows it in the buffer.
+      logic [3:0] wben;
+      always_comb
+        for (int b = 0; b < 4; b++)
+          wben[b] = cpu_hit ? cpu_wmask[8*b] : (eng_we && eng_wmask[4*l + b]);
+
+      // One read port: copy 0 serves the CPU, the rest serve one engine read
+      // port each. The CPU's read is gated on its request, so between requests
+      // the previous word stands -- the bus adapter only samples it behind a
+      // valid response.
+      wire [WA-1:0] raddr = (c == 0) ? cpu_word : eng_raddr[c-1];
+      wire          ren   = (c == 0) ? cpu_req  : 1'b1;
+
+      logic [31:0] rdq;
+
       always_ff @(posedge clk_i) begin
-        if (cpu_req && cpu_we && cpu_lane == LB'(l)) begin
-          for (int b = 0; b < 4; b++)
-            if (cpu_wmask[8*b]) bank[cpu_word][8*b +: 8] <= cpu_wdata[8*b +: 8];
-        end else if (eng_we) begin
-          // The engine's byte mask exists for the vector unit: its last output
-          // word of a run is usually partial, and a full-word write there would
-          // clobber whatever follows it in the buffer.
-          for (int b = 0; b < 4; b++)
-            if (eng_wmask[4*l + b])
-              bank[eng_waddr][8*b +: 8] <= eng_wdata[32*l + 8*b +: 8];
-        end
+        for (int b = 0; b < 4; b++)
+          if (wben[b]) bank[waddr][8*b +: 8] <= wdata[8*b +: 8];
+        if (ren) rdq <= bank[raddr];
       end
 
-      // One read port, registered -- copy 0 serves the CPU, the rest serve one
-      // engine read port each.
       if (c == 0) begin : g_cpu_rd
-        // Default to zero and load only on a request, matching rvlab_bram_main.
-        always_ff @(posedge clk_i) begin
-          cpu_rd_lane[l] <= '0;
-          if (cpu_req) cpu_rd_lane[l] <= bank[cpu_word];
-        end
+        assign cpu_rd_lane[l] = rdq;
       end else begin : g_eng_rd
-        always_ff @(posedge clk_i) eng_rd_lane[c-1][l] <= bank[eng_raddr[c-1]];
+        assign eng_rd_lane[c-1][l] = rdq;
       end
     end
   end
