@@ -32,5 +32,36 @@
         {bits: "1", name: "self_refresh", resval: "0", desc: "DDR3 Self Refresh Enable"}
       ]
     },
+    // Appended after ctrl rather than inserted before it: every register in
+    // a reggen block sits at the offset of the ones above it, so a register
+    // added in the middle moves everything after it and software built
+    // against the old map writes into the wrong place. The sibling project
+    // this watchdog comes from put it before ctrl and spent a day on a DDR3
+    // controller that never came out of reset (docs/DEBUGGING.md section 4).
+    {
+      name: "wdog_addr"
+      desc: '''Address of the oldest TL-UL request on the DDR3 port that has
+              not been answered. Latched by student_tl_watch and readable over
+              JTAG system-bus access, which keeps working when the CPU is
+              wedged on a load and therefore cannot be halted at all.'''
+      swaccess: "ro"
+      hwaccess: "hwo"
+      hwext: "true"
+      fields: [
+        {bits: "31:0", name: "val", desc: "Address of the stalled request"}
+      ]
+    }
+    {
+      name: "wdog_stat"
+      desc: '''Status of the stalled-request watchdog. stall_cycles saturates,
+              so a non-zero value that stops advancing means the request was
+              answered, while one pinned at the maximum means it never was.'''
+      swaccess: "ro"
+      hwaccess: "hwo"
+      hwext: "true"
+      fields: [
+        {bits: "31:0", name: "val", desc: "{stall_cycles[15:0], src[7:0], outstanding[4:0], opcode[2:0]}"}
+      ]
+    }
   ]
 }

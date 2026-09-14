@@ -75,6 +75,28 @@ module rvlab_tlul_ddr (
   assign hw2reg.status.calib_complete.d = ctrl_calib_complete;
   assign hw2reg.status.calib_status.d = ctrl_calib_status;
 
+  /* Stalled-transaction watchdog.
+   *
+   * A CPU wedged on a DDR3 load cannot be halted, so the debugger cannot
+   * report where it is. JTAG system-bus reads still work, so record in
+   * hardware what the core can no longer be asked: which request went
+   * unanswered, from which master, and for how long. Pure observer -- it
+   * drives nothing on the bus. See docs/DEBUGGING.md section 3 in the
+   * tiny-tpu superproject for the hang this was built to find. */
+  logic [31:0] wdog_addr, wdog_stat;
+
+  student_tl_watch watch_i (
+    .clk_i,
+    .rst_ni,
+    .tl_h2d_i   (tl_i),
+    .tl_d2h_i   (tl_o),
+    .wdog_addr_o(wdog_addr),
+    .wdog_stat_o(wdog_stat)
+  );
+
+  assign hw2reg.wdog_addr.d = wdog_addr;
+  assign hw2reg.wdog_stat.d = wdog_stat;
+
   assign ctrl_ddr_self_refresh = reg2hw.ctrl.self_refresh.q;
   assign ctrl_ddr_rst_n = reg2hw.ctrl.rst_n.q;
 
@@ -182,20 +204,54 @@ module rvlab_tlul_ddr (
       cache_req.a_valid = '0;
       tl_o.d_error = '1;
     end
+
+    /* a_ready must come from whichever module is actually going to accept the
+     * request, not from whichever one happens to be answering this cycle.
+     *
+     * Taking it from err_resp_rsp above is wrong once calibration completes:
+     * tlul_err_resp holds a_ready high whenever it is idle, but its a_valid is
+     * forced to zero here, so it never takes anything. A request issued while
+     * the cache is not ready was therefore handshaked away by the bus and
+     * accepted by nobody, and no response for it can ever exist. Measured on
+     * hardware as 30 transactions outstanding on this port and saturated,
+     * with the CPU wedged on a bus access it can never retire
+     * (docs/DEBUGGING.md section 3). The CPU alone rarely hits the window; an
+     * accelerator with several writes in flight hits it every run. */
+    tl_o.a_ready = ctrl_calib_complete ? cache_rsp.a_ready : err_resp_rsp.a_ready;
   end
 
-  /* Prefetcher */
+  /* Prefetcher, bypassable.
+   *
+   * The prefetcher as it stood before upstream's refactor (commit 951fa84)
+   * returned the wrong line when two regions alias in the direct-mapped
+   * cache: a weight blob at 0x80000000 walked against an activation arena at
+   * 0x82000000 collides in every set, and 65 of 256 reads came back holding
+   * the alias partner's data, another set's data, or zeros. With the
+   * prefetcher bypassed the same test passed 256/256, so the cache was not at
+   * fault (docs/DEBUGGING.md section 5).
+   *
+   * The refactored prefetcher in this tree has not been tested against that
+   * pattern, so the bypass stays on until it is. It costs read bandwidth,
+   * which this design has to spare: sw/tiling.py puts a ViT-S block's DRAM
+   * time a full second under the array's compute floor. Correctness first;
+   * switch it back on with the alias test in hand, not before. */
+  localparam bit USE_PREFETCH = 1'b0;
 
-  rvlab_ddr_prefetch prefetcher_i (
-    .clk_i,
-    .rst_ni,
+  if (USE_PREFETCH) begin : gen_prefetch
+    rvlab_ddr_prefetch prefetcher_i (
+      .clk_i,
+      .rst_ni,
 
-    .fe_req_i(llc_req),
-    .fe_rsp_o(llc_rsp),
+      .fe_req_i(llc_req),
+      .fe_rsp_o(llc_rsp),
 
-    .be_req_o(prefetch_req),
-    .be_rsp_i(prefetch_rsp)
-  );
+      .be_req_o(prefetch_req),
+      .be_rsp_i(prefetch_rsp)
+    );
+  end else begin : gen_no_prefetch
+    assign prefetch_req = llc_req;
+    assign llc_rsp      = prefetch_rsp;
+  end
 
   /* CDC FIFO */
 
