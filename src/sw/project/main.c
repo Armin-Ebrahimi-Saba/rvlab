@@ -368,6 +368,67 @@ static int run_block(void) {
     return 0;
 }
 
+/* ------------------------------------------------------------- the model
+ *
+ * After the self-tests, bring DDR3 up and take delivery of the weight blob.
+ *
+ * The blob is written into DDR3 over JTAG by tools/load_model.py while this
+ * program waits, and the handshake that says "it is all there" is a variable
+ * in BRAM, not a word in DDR3: the CPU reads DDR3 through a cache, so a flag
+ * placed there can be read stale for as long as the line stays resident. The
+ * sibling project that first did this lost a day to exactly that
+ * (docs/DEBUGGING.md section 1 in the superproject).
+ *
+ * Then a checksum over the whole blob, read back through the CPU's own path,
+ * so the host can compare it with the file. That is what "the model is loaded"
+ * means here: every one of its bytes is in DRAM and reads back correctly
+ * through the cache the accelerator's DMA and the CPU both sit behind.
+ */
+
+#define BLOB_ADDR   0x80000000u
+#define BLOB_GO     0x5B10Bu      /* what the host writes when the blob is in */
+
+/* Layout of the blob's first 48 bytes, from the sibling project's exporter
+ * (dav2.h: dav2_header_t). Only total_bytes is needed to bound the checksum. */
+typedef struct {
+    uint32_t magic, version, n_tensors, dir_off, data_off, total_bytes;
+    uint32_t reserved[6];
+} blob_header_t;
+
+volatile uint32_t blob_go;    /* BRAM; address taken from the ELF by the host */
+
+static int take_delivery_of_blob(void) {
+    if (ddr_init()) return 1;
+
+    blob_go = 0;
+    printf("tinytpu: BLOB_READY\n");
+    while (blob_go != BLOB_GO) { }
+
+    const volatile blob_header_t *h = (const volatile blob_header_t *)BLOB_ADDR;
+    uint32_t magic = h->magic, total = h->total_bytes;
+    printf("tinytpu: blob magic %08lx version %lu tensors %lu total %lu bytes\n",
+           (unsigned long)magic, (unsigned long)h->version,
+           (unsigned long)h->n_tensors, (unsigned long)total);
+    if (total < sizeof(blob_header_t) || total > 0x02000000u) {
+        printf("tinytpu: FAIL blob header does not describe a blob\n");
+        return 1;
+    }
+
+    /* Word sum with rotation, so a swapped pair of words changes the result.
+     * tools/load_model.py computes the same thing over the file. */
+    unsigned long t0 = CYC();
+    uint32_t sum = 0;
+    const volatile uint32_t *p = (const volatile uint32_t *)BLOB_ADDR;
+    for (uint32_t i = 0; i < total / 4u; i++) {
+        sum = ((sum << 1) | (sum >> 31)) ^ p[i];
+    }
+    unsigned long dt = CYC() - t0;
+    printf("tinytpu: blob checksum (device) %08lx over %lu bytes,"
+           " %lu cycles (%lu cycles/KB)\n",
+           (unsigned long)sum, (unsigned long)total, dt, dt / (total / 1024u));
+    return 0;
+}
+
 int main(void) {
     uint32_t id = TPU_REG(TINYTPU_ID_OFFSET);
     if (id != 0x54505530u) {
@@ -480,6 +541,7 @@ int main(void) {
     /* The vector ops reuse all three buffers, so they only run once the GEMM
      * result has been read back and checked. */
     if (run_vector_ops()) return 1;
+    if (run_block()) return 1;
 
-    return run_block();
+    return take_delivery_of_blob();
 }
