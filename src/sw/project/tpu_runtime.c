@@ -31,13 +31,18 @@ typedef struct {
     uint32_t op, a_dram, a_words, b_dram, b_words, src_a, src_b, dst, shape;
     uint32_t cfg_dram, cfg_dst, cfg_n;
     uint32_t vmult, vmult_b, vshift, eps_lo, eps_hi;
-    uint32_t out_dram, out_words, check_dram, check_n, name_off;
-    uint32_t pad[2];
+    uint32_t out_dram, out_cols, out_rows, out_stride, check_dram, check_n, name_off;
 } tpu_desc_t;
+
+#define BLOB_VERSION 2u
+
+/* After this many failed ops the rest are not worth the hostio bytes: every
+ * op downstream of a wrong result is wrong too. */
+#define MAX_FAILED_OPS 4u
 
 typedef struct {
     char     magic[4];
-    uint32_t version, n_desc, desc_off, names_off, data_off, total, base;
+    uint32_t version, n_desc, desc_off, names_off, data_off, total, base, arena_bytes;
 } tpu_header_t;
 
 /* Compares `n` int8 results at OUT[dst..] against the bytes at `want`, and
@@ -71,8 +76,21 @@ int tpu_run_blob(uint32_t blob_addr, int verify) {
                (unsigned long)h->base, (unsigned long)blob_addr);
         return 1;
     }
+    if (h->version != BLOB_VERSION) {
+        printf("tinytpu: blob format v%lu, this driver reads v%u\n",
+               (unsigned long)h->version, BLOB_VERSION);
+        return 1;
+    }
     printf("tinytpu: blob v%lu, %lu descriptors, %lu bytes\n",
            (unsigned long)h->version, (unsigned long)h->n_desc, (unsigned long)h->total);
+
+    /* The arena above the blob is where ops leave activations for each other.
+     * Some of it is padding that is read but never written -- the rows past
+     * the last token of a key tensor, say -- and the exporter assumes zeros. */
+    {
+        volatile uint32_t *arena = (volatile uint32_t *)(blob_addr + h->total);
+        for (uint32_t w = 0; w < h->arena_bytes / 4u; w++) arena[w] = 0;
+    }
 
     const volatile tpu_desc_t *descs = (const volatile tpu_desc_t *)(blob_addr + h->desc_off);
     unsigned long c_cfg = 0, c_run = 0, c_chk = 0, c_out = 0;
@@ -127,18 +145,26 @@ int tpu_run_blob(uint32_t blob_addr, int verify) {
 
         /* Results leave the chip through the CPU for now: one 32-bit load from
          * the aperture and one store to DRAM per word. The DMA only fills
-         * buffers. This is the known cost of the first picture, not a design. */
+         * buffers. This is the known cost of the first picture, not a design.
+         * Rows are packed in the result region and strided in DRAM, so a tile
+         * lands inside the tensor it belongs to. */
         if (d.out_dram) {
             t0 = TPU_CYC();
-            volatile uint32_t *dst = (volatile uint32_t *)d.out_dram;
-            unsigned base = (d.dst & 0xFFFFu) * 4u;
-            for (uint32_t w = 0; w < d.out_words * 4u; w++) dst[w] = TPU_OUT[base + w];
+            const volatile uint32_t *src = &TPU_OUT[(d.dst & 0xFFFFu) * 4u];
+            uint32_t cols = d.out_cols / 4u;
+            for (uint32_t r = 0; r < d.out_rows; r++) {
+                volatile uint32_t *dst = (volatile uint32_t *)(d.out_dram + r * d.out_stride);
+                for (uint32_t w = 0; w < cols; w++) dst[w] = *src++;
+            }
             c_out += TPU_CYC() - t0;
         }
 
         if (verify && d.check_n) {
             t0 = TPU_CYC();
-            if (check(&d, name)) failed++;
+            if (check(&d, name) && ++failed >= MAX_FAILED_OPS) {
+                printf("tinytpu: giving up after %u failed ops\n", failed);
+                break;
+            }
             c_chk += TPU_CYC() - t0;
         }
     }
