@@ -32,44 +32,8 @@
 #include "gemm_vectors.h"
 #include "block_vectors.h"
 
-/* Fast-aperture layout: the top two address bits pick the region. */
-#define TPU_REGION(i)   ((volatile uint32_t *)(TINYTPU_CORE_BASE_ADDR + ((i) << 16)))
-#define TPU_ACT         TPU_REGION(0)
-#define TPU_WGT         TPU_REGION(1)
-#define TPU_OUT         TPU_REGION(2)
-#define TPU_CFG         TPU_REGION(3)
-
-#define TPU_REG(off)    (*(volatile uint32_t *)(TINYTPU_REGS_BASE_ADDR + (off)))
-
-#define TPU_STATUS_FIELD(f)                                       \
-    ((TPU_REG(TINYTPU_STATUS_OFFSET) >> TINYTPU_STATUS_##f##_LSB) \
-     & TINYTPU_STATUS_##f##_MASK)
-
-/* Config-region layout, in 32-bit words from TPU_CFG. The GEMM's per-channel
- * constants own the lower three quarters; the top quarter holds the vector
- * unit's tables. */
-#define TPU_TAB         12288u
-#define TPU_LN_PAR      (TPU_TAB)             /* gamma, beta -- two words each */
-#define TPU_EXP_LO      (TPU_TAB + 2048u)
-#define TPU_EXP_HI      (TPU_TAB + 2048u + 256u)
-#define TPU_UN_LUT      (TPU_TAB + 2048u + 512u)
-
-#define TPU_OP_GEMM      0u
-#define TPU_OP_SOFTMAX   1u
-#define TPU_OP_LAYERNORM 2u
-#define TPU_OP_QADD      3u
-#define TPU_OP_UNARY     4u
-#define TPU_OP_TRANSPOSE 5u
-
-/* Regions as the DMA descriptor numbers them, matching the address decode. */
-/* src_a / src_b carry a region as well as a word index, so an operand can be
- * named where it already is. */
-#define TPU_SRC(region, word) \
-    ((uint32_t)(word) | ((uint32_t)(region) << TINYTPU_SRC_A_REGION_LSB))
-
-#define TPU_DMA_ACT 0u
-#define TPU_DMA_WGT 1u
-#define TPU_DMA_OUT 2u
+#include "tpu.h"
+#include "tpu_runtime.h"
 
 static void tpu_load(volatile uint32_t *dst, const uint32_t *src, unsigned n) {
     for (unsigned i = 0; i < n; i++) dst[i] = src[i];
@@ -78,7 +42,7 @@ static void tpu_load(volatile uint32_t *dst, const uint32_t *src, unsigned n) {
 /* Runs one op and waits for it. Returns the spin count, or 0 if the poll never
  * had to wait -- which the caller treats as a failure for the same reason the
  * GEMM poll does. */
-static unsigned tpu_run(unsigned opcode) {
+unsigned tpu_run(unsigned opcode) {
     unsigned spins = 0;
     TPU_REG(TINYTPU_OP_OFFSET) = opcode;
     TPU_REG(TINYTPU_CTRL_OFFSET) = 1u << TINYTPU_CTRL_CLR_DONE_LSB;
@@ -200,15 +164,17 @@ static unsigned dma_spins_total;
  * the CPU look?", which conflates the bus round trip of the poll itself with
  * the work being waited on. mcycle answers the question step 2 actually asks:
  * where does the wall clock go. */
-static unsigned long cyc_dma, cyc_run, cyc_cfg, cyc_chk;
-static unsigned long dma_bytes;
-#define CYC() ((unsigned long)read_csr("mcycle"))
+static unsigned long cyc_run, cyc_cfg, cyc_chk;
+unsigned long tpu_dma_cycles, tpu_dma_bytes;
+#define cyc_dma   tpu_dma_cycles
+#define dma_bytes tpu_dma_bytes
+#define CYC() TPU_CYC()
 
 /* One 128-bit-word-granular copy into a buffer region. `src` is a byte address
  * anywhere the main crossbar reaches, which includes tiny-tpu's own fast
  * aperture -- that is what makes region-to-region copies possible without the
  * CPU touching the data. */
-static int tpu_dma(uint32_t src, unsigned dst_region, unsigned dst_word, unsigned words) {
+int tpu_dma(uint32_t src, unsigned dst_region, unsigned dst_word, unsigned words) {
     if (words == 0) return 0;
     unsigned long t0 = CYC();
     dma_bytes += words * 16u;
@@ -391,9 +357,16 @@ static int run_block(void) {
 /* Layout of the blob's first 48 bytes, from the sibling project's exporter
  * (dav2.h: dav2_header_t). Only total_bytes is needed to bound the checksum. */
 typedef struct {
-    uint32_t magic, version, n_tensors, dir_off, data_off, total_bytes;
-    uint32_t reserved[6];
+    uint32_t magic, version, w2, w3, w4, w5, w6;
+    uint32_t reserved[5];
 } blob_header_t;
+
+/* Two blob formats arrive here. "DAV2" (the sibling exporter's, a weight
+ * store) keeps its byte count at word 5; "TPU1" (sw/export_tpu.py, a program)
+ * at word 6. Only the count matters to the checksum. */
+static uint32_t blob_total(const volatile blob_header_t *h) {
+    return h->magic == 0x31555054u ? h->w6 : h->w5;
+}
 
 volatile uint32_t blob_go;    /* BRAM; address taken from the ELF by the host */
 
@@ -405,10 +378,9 @@ static int take_delivery_of_blob(void) {
     while (blob_go != BLOB_GO) { }
 
     const volatile blob_header_t *h = (const volatile blob_header_t *)BLOB_ADDR;
-    uint32_t magic = h->magic, total = h->total_bytes;
-    printf("tinytpu: blob magic %08lx version %lu tensors %lu total %lu bytes\n",
-           (unsigned long)magic, (unsigned long)h->version,
-           (unsigned long)h->n_tensors, (unsigned long)total);
+    uint32_t magic = h->magic, total = blob_total(h);
+    printf("tinytpu: blob magic %08lx version %lu total %lu bytes\n",
+           (unsigned long)magic, (unsigned long)h->version, (unsigned long)total);
     if (total < sizeof(blob_header_t) || total > 0x02000000u) {
         printf("tinytpu: FAIL blob header does not describe a blob\n");
         return 1;
@@ -426,6 +398,10 @@ static int take_delivery_of_blob(void) {
     printf("tinytpu: blob checksum (device) %08lx over %lu bytes,"
            " %lu cycles (%lu cycles/KB)\n",
            (unsigned long)sum, (unsigned long)total, dt, dt / (total / 1024u));
+
+    /* A TPU1 blob is a program; anything else was just a delivery. */
+    if (magic == 0x31555054u)           /* "TPU1", little-endian */
+        return tpu_run_blob(BLOB_ADDR, 1);
     return 0;
 }
 

@@ -40,7 +40,9 @@ BLOB_GO = 0x5B10B                     # BLOB_GO in main.c
 def file_checksum(path: Path) -> tuple[int, int]:
     """The device's rotate-xor over whole words, from the header's total_bytes."""
     data = path.read_bytes()
-    total = int.from_bytes(data[20:24], "little")
+    # "DAV2" blobs keep their byte count at word 5, "TPU1" at word 6 -- the
+    # same two the driver's blob_total() reads.
+    total = int.from_bytes(data[24:28] if data[:4] == b"TPU1" else data[20:24], "little")
     words = memoryview(data)[: total & ~3].cast("I")
     s = 0
     for w in words:
@@ -96,6 +98,7 @@ def main() -> int:
     ap.add_argument("--elf", type=Path, default=RVLAB / "build/sw_project/build/sw.elf")
     ap.add_argument("--cfg", type=Path, default=RVLAB / "src/design/openocd/fpga.cfg")
     ap.add_argument("--log", type=Path, default=Path("openocd.log"))
+    ap.add_argument("--timeout", type=float, default=600.0, help="seconds to wait for a program blob's verdict")
     a = ap.parse_args()
 
     go_addr = symbol_address(a.elf, "blob_go")
@@ -151,13 +154,23 @@ def main() -> int:
                 print(read_wdog(ocd), flush=True)
                 return 4
             got = int(m.group(1), 16)
-            con.wait_for(r"\Z\A", timeout=2)          # drain the tail
             if got != want or int(m.group(2)) != total:
                 print(f"\nMISMATCH: device {got:08x} over {m.group(2)}, "
                       f"file {want:08x} over {total}", flush=True)
                 return 5
-            print(f"\nmodel loaded: {total} bytes in DDR3, checksum {got:08x} matches the file",
+            print(f"\nblob loaded: {total} bytes in DDR3, checksum {got:08x} matches the file",
                   flush=True)
+
+            # A TPU1 blob is a program and the driver runs it next; wait for
+            # the verdict. Anything else was a delivery and the program ends.
+            if a.blob.read_bytes()[:4] == b"TPU1":
+                m = con.wait_for(r"tinytpu: (PASS|FAIL) blob.*\n.*cycles:.*\n", timeout=a.timeout)
+                if not m:
+                    print("\nno verdict from the device", flush=True)
+                    print(read_wdog(ocd), flush=True)
+                    return 6
+                return 0 if m.group(1) == "PASS" else 7
+            con.wait_for(r"\Z\A", timeout=2)          # drain the tail
             return 0
     finally:
         proc.kill()
