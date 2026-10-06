@@ -84,7 +84,13 @@ class Console:
         while time.monotonic() - t0 < timeout:
             # Read the exit flag before draining: text written just before the
             # program ended is then guaranteed to be in this drain, not lost.
-            ended = self.ocd.readword(Hostio.FLAGS) & 1
+            try:
+                ended = self.ocd.readword(Hostio.FLAGS) & 1
+            except ValueError:
+                # A system-bus read through JTAG occasionally comes back
+                # "failed to read memory" while the CPU is busy on the bus;
+                # one miss says nothing about the program, so poll again.
+                ended = 0
             self.pump()
             m = re.search(pattern, self.text)
             if m:
