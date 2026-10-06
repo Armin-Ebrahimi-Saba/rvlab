@@ -353,6 +353,8 @@ static int run_block(void) {
 
 #define BLOB_ADDR   0x80000000u
 #define BLOB_GO     0x5B10Bu      /* what the host writes when the blob is in */
+#define RUN_GO      0x5B10Cu      /* ...when the input is in and a run should start */
+#define RUN_END     0x5B10Du      /* ...when there are no more runs */
 
 /* Layout of the blob's first 48 bytes, from the sibling project's exporter
  * (dav2.h: dav2_header_t). Only total_bytes is needed to bound the checksum. */
@@ -399,10 +401,20 @@ static int take_delivery_of_blob(void) {
            " %lu cycles (%lu cycles/KB)\n",
            (unsigned long)sum, (unsigned long)total, dt, dt / (total / 1024u));
 
-    /* A TPU1 blob is a program; anything else was just a delivery. */
-    if (magic == 0x31555054u)           /* "TPU1", little-endian */
-        return tpu_run_blob(BLOB_ADDR, 1);
-    return 0;
+    /* A TPU1 blob is a program; anything else was just a delivery. A program
+     * runs once per RUN_GO, so the host can put a new input into the arena
+     * between runs without reloading 30 MB of weights; RUN_END finishes. */
+    if (magic != 0x31555054u)           /* "TPU1", little-endian */
+        return 0;
+    if (tpu_blob_open(BLOB_ADDR)) return 1;
+    int rc = 0;
+    for (unsigned n = 0;; n++) {
+        blob_go = 0;
+        printf("tinytpu: RUN_READY %u\n", n);
+        while (blob_go != RUN_GO && blob_go != RUN_END) { }
+        if (blob_go == RUN_END) return rc;
+        rc |= tpu_blob_run(BLOB_ADDR, 1);
+    }
 }
 
 int main(void) {

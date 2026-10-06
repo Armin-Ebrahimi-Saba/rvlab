@@ -35,6 +35,8 @@ from run_fpga import read_wdog                                   # noqa: E402
 
 BLOB_ADDR = 0x80000000
 BLOB_GO = 0x5B10B                     # BLOB_GO in main.c
+RUN_GO = 0x5B10C                      # RUN_GO
+RUN_END = 0x5B10D                     # RUN_END
 
 
 def file_checksum(path: Path) -> tuple[int, int]:
@@ -63,7 +65,7 @@ class Console:
     """Hostio drained into a buffer we can search, and echoed to stdout."""
 
     def __init__(self, ocd: OpenOcd):
-        self.ocd, self.text = ocd, ""
+        self.ocd, self.text, self.pos = ocd, "", 0
 
     def pump(self) -> None:
         import io
@@ -92,8 +94,11 @@ class Console:
                 # one miss says nothing about the program, so poll again.
                 ended = 0
             self.pump()
-            m = re.search(pattern, self.text)
+            # Each match consumes the text up to its end, so waiting for the
+            # next run's verdict cannot find the previous one's.
+            m = re.compile(pattern).search(self.text, self.pos)
             if m:
+                self.pos = m.end()
                 return m
             if ended:
                 return None
@@ -108,6 +113,9 @@ def main() -> int:
     ap.add_argument("--cfg", type=Path, default=RVLAB / "src/design/openocd/fpga.cfg")
     ap.add_argument("--log", type=Path, default=Path("openocd.log"))
     ap.add_argument("--timeout", type=float, default=600.0, help="seconds to wait for a program blob's verdict")
+    ap.add_argument("--inputs", type=Path, nargs="*", default=[],
+                    help="a program blob: one run per file, each written to the sidecar's input "
+                         "address first; taps land beside each input as X.tapN.bin")
     a = ap.parse_args()
 
     go_addr = symbol_address(a.elf, "blob_go")
@@ -170,31 +178,53 @@ def main() -> int:
             print(f"\nblob loaded: {total} bytes in DDR3, checksum {got:08x} matches the file",
                   flush=True)
 
-            # A TPU1 blob is a program and the driver runs it next; wait for
-            # the verdict. Anything else was a delivery and the program ends.
+            # A TPU1 blob is a program: the driver runs it once per RUN_GO,
+            # with an input written into its arena first if there is one.
+            # Anything else was a delivery and the program ends.
             if a.blob.read_bytes()[:4] == b"TPU1":
-                m = con.wait_for(r"tinytpu: (PASS|FAIL) blob.*\n.*cycles:.*\n", timeout=a.timeout)
-                if not m:
-                    print("\nno verdict from the device", flush=True)
-                    print(read_wdog(ocd), flush=True)
-                    return 6
-                # The exporter's sidecar names tensors the host wants back --
-                # the encoder's taps, and any `dumps` asked for when debugging.
-                # They come out through the debug port in this session, even
-                # after a FAIL: a fresh OpenOCD attach resets the SoC and DDR3
-                # with it, so afterwards they are gone.
+                import json
                 side = a.blob.with_suffix(".json")
-                if side.exists():
-                    import json
-                    meta = json.loads(side.read_text())
+                meta = json.loads(side.read_text()) if side.exists() else {}
+                if a.inputs and "input" not in meta:
+                    print("\nthis blob takes no input (no 'input' in its sidecar)", flush=True)
+                    return 2
+                runs = a.inputs or [None]
+                verdicts = []
+                for n, inp in enumerate(runs):
+                    if not con.wait_for(rf"tinytpu: RUN_READY {n}\n", timeout=120):
+                        print("\ndriver never became ready for a run", flush=True)
+                        return 6
+                    if inp is not None:
+                        t = meta["input"]
+                        if inp.stat().st_size != t["bytes"]:
+                            print(f"\n{inp}: {inp.stat().st_size} bytes, the program takes {t['bytes']}")
+                            return 2
+                        ocd.cmd(f"load_image {inp} {t['addr']:#x} bin")
+                        print(f"  input {inp.name}: {t['bytes']} bytes -> {t['addr']:#x}", flush=True)
+                    ocd.writeword(go_addr, RUN_GO)
+                    t0 = time.monotonic()
+                    m = con.wait_for(r"tinytpu: (PASS|FAIL) blob.*\n.*cycles:.*\n", timeout=a.timeout)
+                    if not m:
+                        print("\nno verdict from the device", flush=True)
+                        print(read_wdog(ocd), flush=True)
+                        return 6
+                    verdicts.append(m.group(1))
+                    print(f"  run {n}: {m.group(1)} in {time.monotonic() - t0:.1f} s wall", flush=True)
+                    # Tensors the sidecar names -- the taps, any debug dumps --
+                    # come out through the debug port in this session, even
+                    # after a FAIL: a fresh OpenOCD attach resets the SoC and
+                    # DDR3 with it, so afterwards they are gone.
+                    stem = str(inp) if inp is not None else str(a.blob)
                     want = [(f"tap{j}", t) for j, t in enumerate(meta.get("taps", []))]
                     want += [(t["name"].replace("/", "_"), t) for t in meta.get("dumps", [])]
                     for tag, t in want:
-                        out = Path(f"{a.blob}.{tag}.bin")
+                        out = Path(f"{stem}.{tag}.bin")
                         ocd.cmd(f"dump_image {out} {t['addr']:#x} {t['bytes']}")
                         print(f"  {t['name']}: {t['bytes']} bytes from {t['addr']:#x} -> {out}",
                               flush=True)
-                return 0 if m.group(1) == "PASS" else 7
+                con.wait_for(rf"tinytpu: RUN_READY {len(runs)}\n", timeout=120)
+                ocd.writeword(go_addr, RUN_END)
+                return 0 if all(v == "PASS" for v in verdicts) else 7
             con.wait_for(r"\Z\A", timeout=2)          # drain the tail
             return 0
     finally:

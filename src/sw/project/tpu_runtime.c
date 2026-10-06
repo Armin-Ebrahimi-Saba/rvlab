@@ -65,7 +65,7 @@ static unsigned check(const tpu_desc_t *d, const char *name) {
     return bad;
 }
 
-int tpu_run_blob(uint32_t blob_addr, int verify) {
+int tpu_blob_open(uint32_t blob_addr) {
     const volatile tpu_header_t *h = (const volatile tpu_header_t *)blob_addr;
     if (h->magic[0] != 'T' || h->magic[1] != 'P' || h->magic[2] != 'U' || h->magic[3] != '1') {
         printf("tinytpu: not a TPU1 blob at %08lx\n", (unsigned long)blob_addr);
@@ -86,12 +86,16 @@ int tpu_run_blob(uint32_t blob_addr, int verify) {
 
     /* The arena above the blob is where ops leave activations for each other.
      * Some of it is padding that is read but never written -- the rows past
-     * the last token of a key tensor, say -- and the exporter assumes zeros. */
-    {
-        volatile uint32_t *arena = (volatile uint32_t *)(blob_addr + h->total);
-        for (uint32_t w = 0; w < h->arena_bytes / 4u; w++) arena[w] = 0;
-    }
+     * the last token of a key tensor, say -- and the exporter assumes zeros.
+     * Nothing ever writes the padding, so once per blob is enough, and the
+     * host may then put an input into the arena before each run. */
+    volatile uint32_t *arena = (volatile uint32_t *)(blob_addr + h->total);
+    for (uint32_t w = 0; w < h->arena_bytes / 4u; w++) arena[w] = 0;
+    return 0;
+}
 
+int tpu_blob_run(uint32_t blob_addr, int verify) {
+    const volatile tpu_header_t *h = (const volatile tpu_header_t *)blob_addr;
     const volatile tpu_desc_t *descs = (const volatile tpu_desc_t *)(blob_addr + h->desc_off);
     unsigned long c_cfg = 0, c_run = 0, c_chk = 0, c_out = 0;
     unsigned ops = 0, failed = 0;
