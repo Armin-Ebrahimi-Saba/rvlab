@@ -82,11 +82,14 @@ class Console:
     def wait_for(self, pattern: str, timeout: float) -> re.Match | None:
         t0 = time.monotonic()
         while time.monotonic() - t0 < timeout:
+            # Read the exit flag before draining: text written just before the
+            # program ended is then guaranteed to be in this drain, not lost.
+            ended = self.ocd.readword(Hostio.FLAGS) & 1
             self.pump()
             m = re.search(pattern, self.text)
             if m:
                 return m
-            if self.ocd.readword(Hostio.FLAGS) & 1:
+            if ended:
                 return None
             time.sleep(0.05)
         return None
@@ -169,6 +172,22 @@ def main() -> int:
                     print("\nno verdict from the device", flush=True)
                     print(read_wdog(ocd), flush=True)
                     return 6
+                # The exporter's sidecar names tensors the host wants back --
+                # the encoder's taps, and any `dumps` asked for when debugging.
+                # They come out through the debug port in this session, even
+                # after a FAIL: a fresh OpenOCD attach resets the SoC and DDR3
+                # with it, so afterwards they are gone.
+                side = a.blob.with_suffix(".json")
+                if side.exists():
+                    import json
+                    meta = json.loads(side.read_text())
+                    want = [(f"tap{j}", t) for j, t in enumerate(meta.get("taps", []))]
+                    want += [(t["name"].replace("/", "_"), t) for t in meta.get("dumps", [])]
+                    for tag, t in want:
+                        out = Path(f"{a.blob}.{tag}.bin")
+                        ocd.cmd(f"dump_image {out} {t['addr']:#x} {t['bytes']}")
+                        print(f"  {t['name']}: {t['bytes']} bytes from {t['addr']:#x} -> {out}",
+                              flush=True)
                 return 0 if m.group(1) == "PASS" else 7
             con.wait_for(r"\Z\A", timeout=2)          # drain the tail
             return 0
