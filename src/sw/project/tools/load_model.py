@@ -217,6 +217,8 @@ def main() -> int:
                     stem = str(inp) if inp is not None else str(a.blob)
                     want = [(f"tap{j}", t) for j, t in enumerate(meta.get("taps", []))]
                     want += [(t["name"].replace("/", "_"), t) for t in meta.get("dumps", [])]
+                    if "depth" in meta:
+                        want.append(("depth", meta["depth"]))
                     for tag, t in want:
                         out = Path(f"{stem}.{tag}.bin")
                         ocd.cmd(f"dump_image {out} {t['addr']:#x} {t['bytes']}")

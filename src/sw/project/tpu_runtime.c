@@ -32,9 +32,44 @@ typedef struct {
     uint32_t cfg_dram, cfg_dst, cfg_n;
     uint32_t vmult, vmult_b, vshift, eps_lo, eps_hi;
     uint32_t out_dram, out_cols, out_rows, out_stride, check_dram, check_n, name_off;
+    uint32_t g_src, g_hw, g_cw, g_k, g_p0, out_grp, out_grp_stride, pad;
 } tpu_desc_t;
 
-#define BLOB_VERSION 2u
+#define BLOB_VERSION 3u
+
+/* Builds a GEMM tile's activation operand as im2col rows, straight into the
+ * activation buffer: row i is output pixel g_p0 + i, and holds kernel taps
+ * t0..t1-1 in row-major order, each the C bytes of one input pixel, or zeros
+ * where the tap falls in the padding. C is a multiple of 16, so every tap is
+ * whole buffer words and the copy is 32-bit throughout.
+ *
+ * This is the one place the driver computes addresses rather than reading
+ * them: unrolled into descriptors, a 126x126 3x3 conv would be 143,000 DMAs.
+ * The rows are exactly sw/export_head.py's im2col(), which the expected
+ * values are computed from. */
+static void gather_im2col(const tpu_desc_t *d, uint32_t rows) {
+    uint32_t H = d->g_hw & 0xFFFFu, W = d->g_hw >> 16;
+    uint32_t C = d->g_cw & 0xFFFFu, Wo = d->g_cw >> 16;
+    uint32_t k = d->g_k & 0xFFu, stride = (d->g_k >> 8) & 0xFFu, pad = (d->g_k >> 16) & 0xFu;
+    uint32_t t0 = (d->g_k >> 20) & 0x3Fu, t1 = (d->g_k >> 26) & 0x3Fu;
+    uint32_t cw = C / 4u;                              /* u32 words per pixel */
+    volatile uint32_t *dst = TPU_ACT;
+    uint32_t oy = d->g_p0 / Wo, ox = d->g_p0 % Wo;
+    for (uint32_t i = 0; i < rows; i++) {
+        for (uint32_t t = t0; t < t1; t++) {
+            int32_t iy = (int32_t)(oy * stride + t / k) - (int32_t)pad;
+            int32_t ix = (int32_t)(ox * stride + t % k) - (int32_t)pad;
+            if (iy < 0 || ix < 0 || iy >= (int32_t)H || ix >= (int32_t)W) {
+                for (uint32_t w = 0; w < cw; w++) *dst++ = 0;
+            } else {
+                const volatile uint32_t *src = (const volatile uint32_t *)
+                    (d->g_src + ((uint32_t)iy * W + (uint32_t)ix) * C);
+                for (uint32_t w = 0; w < cw; w++) *dst++ = src[w];
+            }
+        }
+        if (++ox == Wo) { ox = 0; oy++; }
+    }
+}
 
 /* After this many failed ops the rest are not worth the hostio bytes: every
  * op downstream of a wrong result is wrong too. */
@@ -97,7 +132,7 @@ int tpu_blob_open(uint32_t blob_addr) {
 int tpu_blob_run(uint32_t blob_addr, int verify) {
     const volatile tpu_header_t *h = (const volatile tpu_header_t *)blob_addr;
     const volatile tpu_desc_t *descs = (const volatile tpu_desc_t *)(blob_addr + h->desc_off);
-    unsigned long c_cfg = 0, c_run = 0, c_chk = 0, c_out = 0;
+    unsigned long c_cfg = 0, c_run = 0, c_chk = 0, c_out = 0, c_gather = 0;
     unsigned ops = 0, failed = 0;
     tpu_dma_cycles = tpu_dma_bytes = 0;
 
@@ -111,7 +146,13 @@ int tpu_blob_run(uint32_t blob_addr, int verify) {
 
         if (d.op == OP_END) break;
 
-        if (d.a_dram && tpu_dma(d.a_dram, TPU_DMA_ACT, 0, d.a_words)) return 1;
+        if (d.g_src) {
+            unsigned long tg = TPU_CYC();
+            gather_im2col(&d, d.shape & 0xFFFu);
+            c_gather += TPU_CYC() - tg;
+        } else if (d.a_dram && tpu_dma(d.a_dram, TPU_DMA_ACT, 0, d.a_words)) {
+            return 1;
+        }
         if (d.b_dram && tpu_dma(d.b_dram, TPU_DMA_WGT, 0, d.b_words)) return 1;
 
         unsigned long t0 = TPU_CYC();
@@ -156,8 +197,10 @@ int tpu_blob_run(uint32_t blob_addr, int verify) {
             t0 = TPU_CYC();
             const volatile uint32_t *src = &TPU_OUT[(d.dst & 0xFFFFu) * 4u];
             uint32_t cols = d.out_cols / 4u;
+            uint32_t grp = d.out_grp ? d.out_grp : d.out_rows;
             for (uint32_t r = 0; r < d.out_rows; r++) {
-                volatile uint32_t *dst = (volatile uint32_t *)(d.out_dram + r * d.out_stride);
+                uint32_t at = (r / grp) * d.out_grp_stride + (r % grp) * d.out_stride;
+                volatile uint32_t *dst = (volatile uint32_t *)(d.out_dram + at);
                 for (uint32_t w = 0; w < cols; w++) dst[w] = *src++;
             }
             c_out += TPU_CYC() - t0;
@@ -175,8 +218,8 @@ int tpu_blob_run(uint32_t blob_addr, int verify) {
 
     printf("tinytpu: %s -- %u ops, %u failed\n", failed ? "FAIL blob" : "PASS blob",
            ops, failed);
-    printf("tinytpu: cycles: dma %lu (%lu bytes), config %lu, engine %lu, "
+    printf("tinytpu: cycles: dma %lu (%lu bytes), gather %lu, config %lu, engine %lu, "
            "result copy %lu; verify %lu\n",
-           tpu_dma_cycles, tpu_dma_bytes, c_cfg, c_run, c_out, c_chk);
+           tpu_dma_cycles, tpu_dma_bytes, c_gather, c_cfg, c_run, c_out, c_chk);
     return failed ? 1 : 0;
 }

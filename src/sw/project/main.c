@@ -383,7 +383,7 @@ static int take_delivery_of_blob(void) {
     uint32_t magic = h->magic, total = blob_total(h);
     printf("tinytpu: blob magic %08lx version %lu total %lu bytes\n",
            (unsigned long)magic, (unsigned long)h->version, (unsigned long)total);
-    if (total < sizeof(blob_header_t) || total > 0x02000000u) {
+    if (total < sizeof(blob_header_t) || total > 0x08000000u) {
         printf("tinytpu: FAIL blob header does not describe a blob\n");
         return 1;
     }
