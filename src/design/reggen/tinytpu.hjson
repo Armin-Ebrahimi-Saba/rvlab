@@ -185,5 +185,102 @@
         {bits: "31:0", name: "val", resval: "0", desc: "eps[63:32]"}
       ]
     }
+    {
+      name: "dma_mode"
+      desc: "What ctrl.dma_start does. Appended after the vector registers so no existing offset moves."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "1:0", name: "mode", resval: "0", desc: "0 = copy dma_len words from dma_src into dma_dst; 1 = gather im2col rows from the [H][W][C] tensor at dma_src into dma_dst; 2 = write dma_rows x dma_wb_cols words from the result buffer at dma_dst.word to dma_src"}
+      ]
+    }
+    {
+      name: "dma_rows"
+      desc: "Gather: output pixels (buffer rows) to build. Write-back: rows to write."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "15:0", name: "n", resval: "0", desc: "row count"}
+      ]
+    }
+    {
+      name: "dma_g_hw"
+      desc: "Gather: the source tensor's height and width in pixels."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "15:0",  name: "h", resval: "0", desc: "height"}
+        {bits: "31:16", name: "w", resval: "0", desc: "width"}
+      ]
+    }
+    {
+      name: "dma_g_cw"
+      desc: "Gather: 128-bit words per source pixel, and the output grid's width."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "15:0",  name: "cw", resval: "0", desc: "words per pixel (channels / 16)"}
+        {bits: "31:16", name: "wo", resval: "0", desc: "output width"}
+      ]
+    }
+    {
+      name: "dma_g_k"
+      desc: "Gather: kernel geometry, packed as the blob descriptor's g_k."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "7:0",   name: "k",      resval: "0", desc: "kernel size"}
+        {bits: "15:8",  name: "stride", resval: "0", desc: "stride"}
+        {bits: "19:16", name: "pad",    resval: "0", desc: "zero padding on every side"}
+        {bits: "25:20", name: "t0",     resval: "0", desc: "first kernel tap, row-major"}
+        {bits: "31:26", name: "t1",     resval: "0", desc: "one past the last tap"}
+      ]
+    }
+    {
+      name: "dma_g_o0"
+      desc: "Gather: the output pixel the first row is for."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "15:0",  name: "oy", resval: "0", desc: "output row"}
+        {bits: "31:16", name: "ox", resval: "0", desc: "output column"}
+      ]
+    }
+    {
+      name: "dma_wb_cols"
+      desc: "Write-back: 128-bit words per row."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "15:0", name: "n", resval: "0", desc: "words per row"}
+      ]
+    }
+    {
+      name: "dma_wb_stride"
+      desc: "Write-back: bytes between consecutive rows in DRAM."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "31:0", name: "bytes", resval: "0", desc: "row stride"}
+      ]
+    }
+    {
+      name: "dma_wb_grp"
+      desc: "Write-back: rows per group; 0 = all rows are one group."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "15:0", name: "n", resval: "0", desc: "rows per group"}
+      ]
+    }
+    {
+      name: "dma_wb_gstride"
+      desc: "Write-back: bytes between the first rows of consecutive groups."
+      swaccess: "rw"
+      hwaccess: "hro"
+      fields: [
+        {bits: "31:0", name: "bytes", resval: "0", desc: "group stride"}
+      ]
+    }
   ]
 }

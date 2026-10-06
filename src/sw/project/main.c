@@ -174,30 +174,39 @@ unsigned long tpu_dma_cycles, tpu_dma_bytes;
  * anywhere the main crossbar reaches, which includes tiny-tpu's own fast
  * aperture -- that is what makes region-to-region copies possible without the
  * CPU touching the data. */
-int tpu_dma(uint32_t src, unsigned dst_region, unsigned dst_word, unsigned words) {
-    if (words == 0) return 0;
-    unsigned long t0 = CYC();
-    dma_bytes += words * 16u;
-    TPU_REG(TINYTPU_DMA_SRC_OFFSET) = src;
-    TPU_REG(TINYTPU_DMA_DST_OFFSET) =
-        dst_word | (dst_region << TINYTPU_DMA_DST_REGION_LSB);
-    TPU_REG(TINYTPU_DMA_LEN_OFFSET) = words;
+/* Starts the DMA as the registers describe and polls it to completion. */
+int tpu_dma_go(const char *what) {
     TPU_REG(TINYTPU_CTRL_OFFSET) = 1u << TINYTPU_CTRL_CLR_DMA_DONE_LSB;
     TPU_REG(TINYTPU_CTRL_OFFSET) = 1u << TINYTPU_CTRL_DMA_START_LSB;
 
     unsigned spins = 0;
     while (!(TPU_STATUS_FIELD(DMA_DONE))) {
-        if (++spins > 2000000u) {
-            printf("tinytpu: DMA timeout src 0x%08lx -> r%u w%u\n",
-                   (unsigned long)src, dst_region, dst_word);
+        if (++spins > 4000000u) {
+            printf("tinytpu: DMA timeout (%s)\n", what);
             return 1;
         }
     }
     if (TPU_STATUS_FIELD(DMA_ERR)) {
-        printf("tinytpu: DMA error src 0x%08lx\n", (unsigned long)src);
+        printf("tinytpu: DMA error (%s)\n", what);
         return 1;
     }
     dma_spins_total += spins;
+    return 0;
+}
+
+int tpu_dma(uint32_t src, unsigned dst_region, unsigned dst_word, unsigned words) {
+    if (words == 0) return 0;
+    unsigned long t0 = CYC();
+    dma_bytes += words * 16u;
+    TPU_REG(TINYTPU_DMA_MODE_OFFSET) = TPU_DMA_MODE_COPY;
+    TPU_REG(TINYTPU_DMA_SRC_OFFSET) = src;
+    TPU_REG(TINYTPU_DMA_DST_OFFSET) =
+        dst_word | (dst_region << TINYTPU_DMA_DST_REGION_LSB);
+    TPU_REG(TINYTPU_DMA_LEN_OFFSET) = words;
+    if (tpu_dma_go("copy")) {
+        printf("tinytpu:   src 0x%08lx -> r%u w%u\n", (unsigned long)src, dst_region, dst_word);
+        return 1;
+    }
     cyc_dma += CYC() - t0;
     return 0;
 }
@@ -417,6 +426,77 @@ static int take_delivery_of_blob(void) {
     }
 }
 
+/* The DMA's gather and write-back modes, against the CPU doing the same
+ * thing word by word. The tensors live in this program's RAM, so this also
+ * runs in the SoC simulation, which has no DDR3. */
+#define DM_H 5
+#define DM_W 6
+#define DM_CW 2                          /* 32 channels: two words a pixel */
+static uint32_t __attribute__((aligned(16))) dm_src[DM_H * DM_W * DM_CW * 4];
+static uint32_t __attribute__((aligned(16))) dm_dst[256];
+
+static int run_dma_modes(void) {
+    for (unsigned i = 0; i < sizeof dm_src / 4; i++) dm_src[i] = 0x9E3779B9u * (i + 1);
+
+    /* gather: 3x3, stride 2, pad 1 -> a 3x3 output; rows 2..7, taps 1..7 */
+    const unsigned k = 3, s = 2, pad = 1, Wo = 3, p0 = 2, rows = 6, t0 = 1, t1 = 7;
+    TPU_REG(TINYTPU_DMA_MODE_OFFSET) = TPU_DMA_MODE_GATHER;
+    TPU_REG(TINYTPU_DMA_SRC_OFFSET)  = (uint32_t)(uintptr_t)dm_src;
+    TPU_REG(TINYTPU_DMA_DST_OFFSET)  = TPU_SRC(TPU_DMA_ACT, 0);
+    TPU_REG(TINYTPU_DMA_ROWS_OFFSET) = rows;
+    TPU_REG(TINYTPU_DMA_G_HW_OFFSET) = DM_H | (DM_W << 16);
+    TPU_REG(TINYTPU_DMA_G_CW_OFFSET) = DM_CW | (Wo << 16);
+    TPU_REG(TINYTPU_DMA_G_K_OFFSET)  = k | (s << 8) | (pad << 16) | (t0 << 20) | (t1 << 26);
+    TPU_REG(TINYTPU_DMA_G_O0_OFFSET) = (p0 / Wo) | ((p0 % Wo) << 16);
+    if (tpu_dma_go("gather self-test")) return 1;
+    unsigned w = 0, bad = 0;
+    for (unsigned r = 0; r < rows; r++) {
+        unsigned oy = (p0 + r) / Wo, ox = (p0 + r) % Wo;
+        for (unsigned t = t0; t < t1; t++) {
+            int iy = (int)(oy * s + t / k) - (int)pad, ix = (int)(ox * s + t % k) - (int)pad;
+            int in = iy >= 0 && ix >= 0 && iy < DM_H && ix < DM_W;
+            for (unsigned c = 0; c < DM_CW * 4; c++, w++) {
+                uint32_t want = in ? dm_src[((unsigned)iy * DM_W + (unsigned)ix) * DM_CW * 4 + c] : 0;
+                if (TPU_ACT[w] != want) bad++;
+            }
+        }
+    }
+    if (bad) {
+        printf("tinytpu: FAIL DMA gather, %u/%u words wrong\n", bad, w);
+        return 1;
+    }
+
+    /* write-back: 5 rows of 2 words from OUT word 3, row stride 48 B,
+     * groups of 2 rows 160 B apart */
+    for (unsigned i = 0; i < 64; i++) TPU_OUT[i] = 0xC0DE0000u + i;
+    for (unsigned i = 0; i < 256; i++) dm_dst[i] = 0xFFFFFFFFu;
+    TPU_REG(TINYTPU_DMA_MODE_OFFSET)       = TPU_DMA_MODE_WRITEBACK;
+    TPU_REG(TINYTPU_DMA_SRC_OFFSET)        = (uint32_t)(uintptr_t)dm_dst;
+    TPU_REG(TINYTPU_DMA_DST_OFFSET)        = TPU_SRC(TPU_DMA_OUT, 3);
+    TPU_REG(TINYTPU_DMA_ROWS_OFFSET)       = 5;
+    TPU_REG(TINYTPU_DMA_WB_COLS_OFFSET)    = 2;
+    TPU_REG(TINYTPU_DMA_WB_STRIDE_OFFSET)  = 48;
+    TPU_REG(TINYTPU_DMA_WB_GRP_OFFSET)     = 2;
+    TPU_REG(TINYTPU_DMA_WB_GSTRIDE_OFFSET) = 160;
+    if (tpu_dma_go("write-back self-test")) return 1;
+    unsigned touched = 0;
+    bad = 0;
+    for (unsigned r = 0; r < 5; r++)
+        for (unsigned u = 0; u < 8; u++) {
+            unsigned at = ((r / 2) * 160 + (r % 2) * 48) / 4 + u;
+            if (dm_dst[at] != 0xC0DE0000u + 12 + r * 8 + u) bad++;
+            touched++;
+        }
+    unsigned untouched = 0;
+    for (unsigned i = 0; i < 256; i++) untouched += dm_dst[i] == 0xFFFFFFFFu;
+    if (bad || untouched != 256 - touched) {
+        printf("tinytpu: FAIL DMA write-back, %u wrong, %u stray\n", bad, 256 - touched - untouched);
+        return 1;
+    }
+    printf("tinytpu: PASS DMA modes -- %u gathered words, %u written back\n", w, touched);
+    return 0;
+}
+
 int main(void) {
     uint32_t id = TPU_REG(TINYTPU_ID_OFFSET);
     if (id != 0x54505530u) {
@@ -529,6 +609,7 @@ int main(void) {
     /* The vector ops reuse all three buffers, so they only run once the GEMM
      * result has been read back and checked. */
     if (run_vector_ops()) return 1;
+    if (run_dma_modes()) return 1;
     if (run_block()) return 1;
 
     return take_delivery_of_blob();

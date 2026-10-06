@@ -219,7 +219,11 @@ module tinytpu #(
 
   assign act_raddr[0] = $clog2(ACT_WORDS)'(eng_a_addr);
   assign wgt_raddr[0] = $clog2(WGT_WORDS)'(eng_b_addr);
-  assign out_raddr[0] = $clog2(OUT_WORDS)'(eng_a_addr);
+  // A write-back borrows operand A's port on the result buffer. The engines
+  // are idle while the DMA runs (the driver's contract), so this only picks.
+  logic [DMA_AW-1:0] dma_rd_addr;
+  assign out_raddr[0] = dma_busy ? $clog2(OUT_WORDS)'(dma_rd_addr)
+                                 : $clog2(OUT_WORDS)'(eng_a_addr);
   assign out_raddr[1] = $clog2(OUT_WORDS)'(eng_b_addr);
   assign act_word_r   = act_rword[0];
   assign wgt_word_r   = wgt_rword[0];
@@ -260,15 +264,35 @@ module tinytpu #(
     .eng_raddr(out_raddr), .eng_rdata(out_word_r)
   );
 
-  // -------------------------------------------------------------- weight DMA
+  // --------------------------------------------------------------------- DMA
+  // Copy, im2col gather and write-back (dma_mode); see tinytpu_wdma.sv.
   tinytpu_wdma #(.WORD_BITS(WORD_BITS), .DST_AW(DMA_AW)) u_wdma (
     .clk_i,
     .rst_ni,
     .start_i     (dma_start_pulse),
+    .mode_i      (reg2hw.dma_mode.q),
     .src_addr_i  (reg2hw.dma_src.q),
     .dst_word_i  (DMA_AW'(reg2hw.dma_dst.word.q)),
     .dst_region_i(reg2hw.dma_dst.region.q),
     .len_i       (17'(reg2hw.dma_len.q)),
+    .rows_i      (reg2hw.dma_rows.q),
+    .g_h_i       (reg2hw.dma_g_hw.h.q),
+    .g_w_i       (reg2hw.dma_g_hw.w.q),
+    .g_cw_i      (reg2hw.dma_g_cw.cw.q),
+    .g_wo_i      (reg2hw.dma_g_cw.wo.q),
+    .g_k_i       (reg2hw.dma_g_k.k.q),
+    .g_stride_i  (reg2hw.dma_g_k.stride.q),
+    .g_pad_i     (reg2hw.dma_g_k.pad.q),
+    .g_t0_i      (reg2hw.dma_g_k.t0.q),
+    .g_t1_i      (reg2hw.dma_g_k.t1.q),
+    .g_oy0_i     (reg2hw.dma_g_o0.oy.q),
+    .g_ox0_i     (reg2hw.dma_g_o0.ox.q),
+    .wb_cols_i   (reg2hw.dma_wb_cols.q),
+    .wb_stride_i (reg2hw.dma_wb_stride.q),
+    .wb_grp_i    (reg2hw.dma_wb_grp.q),
+    .wb_grp_stride_i(reg2hw.dma_wb_gstride.q),
+    .rd_addr_o   (dma_rd_addr),
+    .rd_data_i   (out_word_r[0]),
     .busy_o      (dma_busy),
     .done_o      (dma_done),
     .err_o       (dma_err),

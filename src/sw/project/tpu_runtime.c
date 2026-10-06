@@ -71,6 +71,40 @@ static void gather_im2col(const tpu_desc_t *d, uint32_t rows) {
     }
 }
 
+/* The same rows, built by the DMA's gather mode (tinytpu_wdma.sv): the
+ * descriptor's geometry goes to the registers nearly verbatim -- g_k has the
+ * register's packing -- and only the first pixel is split into (oy, ox). */
+static int gather_dma(const tpu_desc_t *d, uint32_t rows) {
+    uint32_t C = d->g_cw & 0xFFFFu, Wo = d->g_cw >> 16;
+    TPU_REG(TINYTPU_DMA_MODE_OFFSET)  = TPU_DMA_MODE_GATHER;
+    TPU_REG(TINYTPU_DMA_SRC_OFFSET)   = d->g_src;
+    TPU_REG(TINYTPU_DMA_DST_OFFSET)   = TPU_SRC(TPU_DMA_ACT, 0);
+    TPU_REG(TINYTPU_DMA_ROWS_OFFSET)  = rows;
+    TPU_REG(TINYTPU_DMA_G_HW_OFFSET)  = d->g_hw;
+    TPU_REG(TINYTPU_DMA_G_CW_OFFSET)  = (C / 16u) | (Wo << 16);
+    TPU_REG(TINYTPU_DMA_G_K_OFFSET)   = d->g_k;
+    TPU_REG(TINYTPU_DMA_G_O0_OFFSET)  = (d->g_p0 / Wo) | ((d->g_p0 % Wo) << 16);
+    return tpu_dma_go("gather");
+}
+
+/* The result tile out of OUT and into its tensor, by the DMA's write-back
+ * mode: rows of whole buffer words, a row stride, and a group stride. */
+static int writeback_dma(const tpu_desc_t *d) {
+    TPU_REG(TINYTPU_DMA_MODE_OFFSET)       = TPU_DMA_MODE_WRITEBACK;
+    TPU_REG(TINYTPU_DMA_SRC_OFFSET)        = d->out_dram;
+    TPU_REG(TINYTPU_DMA_DST_OFFSET)        = TPU_SRC(TPU_DMA_OUT, d->dst & 0xFFFFu);
+    TPU_REG(TINYTPU_DMA_ROWS_OFFSET)       = d->out_rows;
+    TPU_REG(TINYTPU_DMA_WB_COLS_OFFSET)    = d->out_cols / 16u;
+    TPU_REG(TINYTPU_DMA_WB_STRIDE_OFFSET)  = d->out_stride;
+    TPU_REG(TINYTPU_DMA_WB_GRP_OFFSET)     = d->out_grp;
+    TPU_REG(TINYTPU_DMA_WB_GSTRIDE_OFFSET) = d->out_grp_stride;
+    return tpu_dma_go("write-back");
+}
+
+/* Which paths move data. Both are kept so one build can compare them: the
+ * CPU paths are the reference the DMA's were checked against on the board. */
+int tpu_use_dma_paths = 1;
+
 /* After this many failed ops the rest are not worth the hostio bytes: every
  * op downstream of a wrong result is wrong too. */
 #define MAX_FAILED_OPS 4u
@@ -133,6 +167,7 @@ int tpu_blob_run(uint32_t blob_addr, int verify) {
     const volatile tpu_header_t *h = (const volatile tpu_header_t *)blob_addr;
     const volatile tpu_desc_t *descs = (const volatile tpu_desc_t *)(blob_addr + h->desc_off);
     unsigned long c_cfg = 0, c_run = 0, c_chk = 0, c_out = 0, c_gather = 0;
+    unsigned n_wb = 0;
     unsigned ops = 0, failed = 0;
     tpu_dma_cycles = tpu_dma_bytes = 0;
 
@@ -148,7 +183,11 @@ int tpu_blob_run(uint32_t blob_addr, int verify) {
 
         if (d.g_src) {
             unsigned long tg = TPU_CYC();
-            gather_im2col(&d, d.shape & 0xFFFu);
+            if (tpu_use_dma_paths) {
+                if (gather_dma(&d, d.shape & 0xFFFu)) return 1;
+            } else {
+                gather_im2col(&d, d.shape & 0xFFFu);
+            }
             c_gather += TPU_CYC() - tg;
         } else if (d.a_dram && tpu_dma(d.a_dram, TPU_DMA_ACT, 0, d.a_words)) {
             return 1;
@@ -193,7 +232,14 @@ int tpu_blob_run(uint32_t blob_addr, int verify) {
          * buffers. This is the known cost of the first picture, not a design.
          * Rows are packed in the result region and strided in DRAM, so a tile
          * lands inside the tensor it belongs to. */
-        if (d.out_dram) {
+        if (d.out_dram && tpu_use_dma_paths && (d.out_cols % 16u) == 0 &&
+            (d.out_dram % 16u) == 0 && (d.out_stride % 16u) == 0 &&
+            (d.out_grp_stride % 16u) == 0) {
+            t0 = TPU_CYC();
+            if (writeback_dma(&d)) return 1;
+            c_out += TPU_CYC() - t0;
+            n_wb++;
+        } else if (d.out_dram) {
             t0 = TPU_CYC();
             const volatile uint32_t *src = &TPU_OUT[(d.dst & 0xFFFFu) * 4u];
             uint32_t cols = d.out_cols / 4u;
@@ -219,7 +265,8 @@ int tpu_blob_run(uint32_t blob_addr, int verify) {
     printf("tinytpu: %s -- %u ops, %u failed\n", failed ? "FAIL blob" : "PASS blob",
            ops, failed);
     printf("tinytpu: cycles: dma %lu (%lu bytes), gather %lu, config %lu, engine %lu, "
-           "result copy %lu; verify %lu\n",
-           tpu_dma_cycles, tpu_dma_bytes, c_gather, c_cfg, c_run, c_out, c_chk);
+           "result copy %lu; verify %lu; %s paths, %u write-backs\n",
+           tpu_dma_cycles, tpu_dma_bytes, c_gather, c_cfg, c_run, c_out, c_chk,
+           tpu_use_dma_paths ? "dma" : "cpu", n_wb);
     return failed ? 1 : 0;
 }

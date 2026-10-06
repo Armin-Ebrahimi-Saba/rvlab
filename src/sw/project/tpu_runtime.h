@@ -18,4 +18,8 @@ int tpu_blob_open(uint32_t blob_addr);
  * expected bytes. Prints a PASS/FAIL verdict and the cycle breakdown. */
 int tpu_blob_run(uint32_t blob_addr, int verify);
 
+/* 1 (default): the DMA gathers im2col rows and writes results back.
+ * 0: the CPU does both, word by word, as before the DMA could. */
+extern int tpu_use_dma_paths;
+
 #endif

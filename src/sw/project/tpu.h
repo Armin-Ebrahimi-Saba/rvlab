@@ -60,6 +60,16 @@
  * on timeout or a bus error it prints and returns 1. Adds to the totals. */
 int tpu_dma(uint32_t src, unsigned dst_region, unsigned dst_word, unsigned words);
 
+/* The DMA's modes (dma_mode): a contiguous copy into a buffer, im2col rows
+ * gathered into a buffer, and the result buffer written back to DRAM. */
+#define TPU_DMA_MODE_COPY      0u
+#define TPU_DMA_MODE_GATHER    1u
+#define TPU_DMA_MODE_WRITEBACK 2u
+
+/* Starts the DMA as its registers already describe and polls it to done.
+ * Returns 0, or prints `what` and returns 1 on a timeout or bus error. */
+int tpu_dma_go(const char *what);
+
 /* Starts `opcode` and polls for done. Returns the spin count, 0 on timeout. */
 unsigned tpu_run(unsigned opcode);
 
