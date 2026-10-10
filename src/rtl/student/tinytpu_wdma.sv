@@ -91,7 +91,8 @@ module tinytpu_wdma #(
   localparam logic [1:0] M_COPY = 2'd0, M_GATHER = 2'd1, M_WB = 2'd2;
 
   typedef enum logic [3:0] {
-    S_IDLE, S_REQ, S_RSP, S_WR, S_TAP, S_ADDR, S_ZERO, S_RD, S_RDW, S_WREQ, S_WRSP, S_DONE
+    S_IDLE, S_REQ, S_RSP, S_WR, S_INIT, S_ILOAD, S_TAP, S_ZERO, S_RD, S_RDW, S_WREQ, S_WRSP,
+    S_DONE
   } state_e;
   state_e state;
 
@@ -104,14 +105,25 @@ module tinytpu_wdma #(
   logic [WORD_BITS-1:0] sh_q;
   logic                 err_q;
 
-  // gather
+  // gather. Every address in the transfer is the last one plus a constant --
+  // a pixel (pixb), a kernel row (back), an output column (spix), an output
+  // row (srow) -- so the loop has adders and no multipliers. The constants
+  // and the starting point are products, made once per transfer by a
+  // shift-and-add multiplier (S_INIT): ~11 steps of a few cycles each.
   logic [31:0]  base_q;
-  logic [15:0]  h_q, w_q, cw_q, wo_q, oy_q, ox_q, rows_q;
+  logic [15:0]  h_q, w_q, cw_q, wo_q, ox_q, rows_q, oy0_q, ox0_q;
   logic [7:0]   k_q, stride_q;
   logic [3:0]   pad_q;
   logic [5:0]   t_q, t0_q, t1_q;
   logic [7:0]   ky_q, kx_q, ky0_q, kx0_q;
-  logic signed [17:0] iy_q, ix_q;
+  logic signed [17:0] py_q, px_q;   // the current window's top-left input pixel
+  logic [31:0]  pixb_q, rowb_q, spix_q, srow_q, back_q, off0_q;
+  logic [31:0]  arow_q;             // window address of output column 0, this row
+  logic [31:0]  awin_q;             // window address of this output pixel
+  logic [31:0]  atap_q;             // address of this tap
+  logic [3:0]   step_q;             // S_INIT: which product
+  logic [31:0]  ma_q, mp_q;         // shift-and-add: multiplicand, product
+  logic [15:0]  mb_q;               //                multiplier
 
   // write-back
   logic [15:0]  cols_q, col_q, grp_q, gi_q;
@@ -143,41 +155,52 @@ module tinytpu_wdma #(
   assign busy_o = (state != S_IDLE);
   assign rd_addr_o = dst_q;
 
-  // Gather: where the current tap reads from. iy/ix are registered in S_TAP;
-  // the bounds test and the address follow in S_ADDR.
-  wire tap_in = (iy_q >= 0) && (ix_q >= 0) &&
-                (iy_q < $signed({2'b0, h_q})) && (ix_q < $signed({2'b0, w_q}));
-  wire [31:0] pix = 32'(iy_q[15:0]) * 32'(w_q) + 32'(ix_q[15:0]);
-  wire [31:0] tap_addr = base_q + ((pix * 32'(cw_q)) << 4);
+  // Gather: the current tap's input pixel, and whether it is inside the input.
+  wire signed [17:0] iy = py_q + $signed({10'b0, ky_q});
+  wire signed [17:0] ix = px_q + $signed({10'b0, kx_q});
+  wire tap_in = (iy >= 0) && (ix >= 0) &&
+                (iy < $signed({2'b0, h_q})) && (ix < $signed({2'b0, w_q}));
+  wire signed [17:0] neg_pad = -$signed({14'b0, pad_q});
 
   // Advance to the next tap, or the next output pixel, or finish.
   task automatic next_tap();
     if (t_q + 6'd1 == t1_q) begin
+      // next output pixel: the window steps one column, or wraps a row
       t_q  <= t0_q;
       ky_q <= ky0_q;
       kx_q <= kx0_q;
       if (ox_q + 16'd1 == wo_q) begin
-        ox_q <= '0;
-        oy_q <= oy_q + 16'd1;
+        ox_q   <= '0;
+        py_q   <= py_q + $signed({10'b0, stride_q});
+        px_q   <= neg_pad;
+        arow_q <= arow_q + srow_q;
+        awin_q <= arow_q + srow_q;
+        atap_q <= arow_q + srow_q + off0_q;
       end else begin
-        ox_q <= ox_q + 16'd1;
+        ox_q   <= ox_q + 16'd1;
+        px_q   <= px_q + $signed({10'b0, stride_q});
+        awin_q <= awin_q + spix_q;
+        atap_q <= awin_q + spix_q + off0_q;
       end
       rows_q <= rows_q - 16'd1;
       state  <= (rows_q == 16'd1) ? S_DONE : S_TAP;
     end else begin
       t_q <= t_q + 6'd1;
       if (kx_q + 8'd1 == k_q) begin
-        kx_q <= '0;
-        ky_q <= ky_q + 8'd1;
+        kx_q   <= '0;
+        ky_q   <= ky_q + 8'd1;
+        atap_q <= atap_q + back_q;
       end else begin
-        kx_q <= kx_q + 8'd1;
+        kx_q   <= kx_q + 8'd1;
+        atap_q <= atap_q + pixb_q;
       end
       state <= S_TAP;
     end
   endtask
 
   // ------------------------------------------------------------------- FSM
-  always_ff @(posedge clk_i or negedge rst_ni) begin
+  // Synchronous reset, like everything in src/v2 (report 6.13).
+  always_ff @(posedge clk_i) begin
     if (!rst_ni) begin
       state    <= S_IDLE;
       mode_q   <= '0;
@@ -189,11 +212,12 @@ module tinytpu_wdma #(
       sh_q     <= '0;
       err_q    <= 1'b0;
       base_q   <= '0;
-      {h_q, w_q, cw_q, wo_q, oy_q, ox_q, rows_q} <= '0;
+      {h_q, w_q, cw_q, wo_q, ox_q, rows_q} <= '0;
       {k_q, stride_q, pad_q, t_q, t0_q, t1_q} <= '0;
       {ky_q, kx_q, ky0_q, kx0_q} <= '0;
-      iy_q <= '0;
-      ix_q <= '0;
+      {oy0_q, ox0_q, py_q, px_q, step_q} <= '0;
+      {pixb_q, rowb_q, spix_q, srow_q, back_q, off0_q} <= '0;
+      {arow_q, awin_q, atap_q, ma_q, mp_q, mb_q} <= '0;
       {cols_q, col_q, grp_q, gi_q} <= '0;
       {rstride_q, gstride_q, rowbase_q, grpbase_q} <= '0;
       wr_en_o     <= 1'b0;
@@ -234,12 +258,15 @@ module tinytpu_wdma #(
                 kx0_q    <= 8'(g_t0_i % g_k_i);
                 ky_q     <= 8'(g_t0_i / g_k_i);
                 kx_q     <= 8'(g_t0_i % g_k_i);
-                oy_q     <= g_oy0_i;
+                oy0_q    <= g_oy0_i;
+                ox0_q    <= g_ox0_i;
                 ox_q     <= g_ox0_i;
                 rows_q   <= rows_i;
+                pixb_q   <= 32'(g_cw_i) << 4;
+                step_q   <= '0;
                 // Nothing to do still finishes, so a poll on done never hangs.
                 state <= (rows_i != '0 && g_t1_i > g_t0_i && g_cw_i != '0 && g_k_i != '0)
-                         ? S_TAP : S_DONE;
+                         ? S_ILOAD : S_DONE;
               end
               M_WB: begin
                 rowbase_q <= {src_addr_i[31:4], 4'b0000};
@@ -305,18 +332,59 @@ module tinytpu_wdma #(
         end
 
         // --------------------------------------------------------- gather
-        S_TAP: begin
-          iy_q <= $signed({2'b0, oy_q}) * $signed({10'b0, stride_q}) + $signed({10'b0, ky_q})
-                  - $signed({14'b0, pad_q});
-          ix_q <= $signed({2'b0, ox_q}) * $signed({10'b0, stride_q}) + $signed({10'b0, kx_q})
-                  - $signed({14'b0, pad_q});
-          state <= S_ADDR;
+        // The products a transfer needs, one per step: S_ILOAD picks the
+        // operands (from registers earlier steps have settled), S_INIT
+        // multiplies by shift-and-add -- as many cycles as the multiplier
+        // has bits, mostly one or two -- and files the result.
+        S_ILOAD: begin
+          mp_q <= '0;
+          unique case (step_q)
+            4'd0:  begin ma_q <= 32'(w_q);          mb_q <= cw_q;            end // W * cw
+            4'd1:  begin ma_q <= pixb_q;            mb_q <= 16'(stride_q);   end
+            4'd2:  begin ma_q <= rowb_q;            mb_q <= 16'(stride_q);   end
+            4'd3:  begin ma_q <= srow_q;            mb_q <= oy0_q;           end
+            4'd4:  begin ma_q <= rowb_q + pixb_q;   mb_q <= 16'(pad_q);      end
+            4'd5:  begin ma_q <= spix_q;            mb_q <= ox0_q;           end
+            4'd6:  begin ma_q <= pixb_q;            mb_q <= 16'(k_q) - 16'd1; end
+            4'd7:  begin ma_q <= rowb_q;            mb_q <= 16'(ky0_q);      end
+            4'd8:  begin ma_q <= pixb_q;            mb_q <= 16'(kx0_q);      end
+            4'd9:  begin ma_q <= 32'(stride_q);     mb_q <= oy0_q;           end
+            default: begin ma_q <= 32'(stride_q);   mb_q <= ox0_q;           end
+          endcase
+          state <= S_INIT;
         end
 
-        S_ADDR: begin
+        S_INIT: begin
+          if (mb_q != '0) begin
+            if (mb_q[0]) mp_q <= mp_q + ma_q;
+            ma_q <= ma_q << 1;
+            mb_q <= mb_q >> 1;
+          end else begin
+            unique case (step_q)
+              4'd0:  rowb_q <= mp_q << 4;                    // bytes per input row
+              4'd1:  spix_q <= mp_q;                         // per output column
+              4'd2:  srow_q <= mp_q;                         // per output row
+              4'd3:  arow_q <= base_q + mp_q;                // + oy0 rows of windows
+              4'd4:  arow_q <= arow_q - mp_q;                // - pad rows and pixels
+              4'd5:  awin_q <= arow_q + mp_q;                // + ox0 columns
+              4'd6:  back_q <= rowb_q - mp_q;                // next kernel row
+              4'd7:  off0_q <= mp_q;                         // first tap's offset
+              4'd8:  begin
+                       off0_q <= off0_q + mp_q;
+                       atap_q <= awin_q + off0_q + mp_q;
+                     end
+              4'd9:  py_q <= $signed({2'b0, mp_q[15:0]}) + neg_pad;
+              default: px_q <= $signed({2'b0, mp_q[15:0]}) + neg_pad;
+            endcase
+            step_q <= step_q + 4'd1;
+            state  <= (step_q == 4'd10) ? S_TAP : S_ILOAD;
+          end
+        end
+
+        S_TAP: begin
           rem_q <= 17'(cw_q);
           if (tap_in) begin
-            src_q <= tap_addr;
+            src_q <= atap_q;
             state <= S_REQ;
           end else begin
             state <= S_ZERO;
