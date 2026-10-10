@@ -113,12 +113,16 @@ def main() -> int:
     ap.add_argument("--cfg", type=Path, default=RVLAB / "src/design/openocd/fpga.cfg")
     ap.add_argument("--log", type=Path, default=Path("openocd.log"))
     ap.add_argument("--timeout", type=float, default=600.0, help="seconds to wait for a program blob's verdict")
+    ap.add_argument("--cpu-paths", action="store_true",
+                    help="im2col gather and result copy by the CPU, as before the DMA could; "
+                         "for comparing the two on one build")
     ap.add_argument("--inputs", type=Path, nargs="*", default=[],
                     help="a program blob: one run per file, each written to the sidecar's input "
                          "address first; taps land beside each input as X.tapN.bin")
     a = ap.parse_args()
 
     go_addr = symbol_address(a.elf, "blob_go")
+    paths_addr = symbol_address(a.elf, "tpu_use_dma_paths")
     want, total = file_checksum(a.blob)
     print(f"blob {a.blob}: {total} bytes, checksum {want:08x}; go flag at {go_addr:#010x}",
           flush=True)
@@ -201,6 +205,8 @@ def main() -> int:
                             return 2
                         ocd.cmd(f"load_image {inp} {t['addr']:#x} bin")
                         print(f"  input {inp.name}: {t['bytes']} bytes -> {t['addr']:#x}", flush=True)
+                    if n == 0:
+                        ocd.writeword(paths_addr, 0 if a.cpu_paths else 1)
                     ocd.writeword(go_addr, RUN_GO)
                     t0 = time.monotonic()
                     m = con.wait_for(r"tinytpu: (PASS|FAIL) blob.*\n.*cycles:.*\n", timeout=a.timeout)
